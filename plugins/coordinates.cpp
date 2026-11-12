@@ -6,6 +6,8 @@
 //   #save <name>     saves a spot with that name                                    (typed in chat)
 //   #return [name]   puts you, or the vehicle you drive, back on it; no name = the last spot saved
 //   #note <text>     saves the text with where you are
+//   #seat            (sitting in a vehicle) writes every seat of it and every bone of whoever sits in one to
+//                    plugins\seat_probe.txt, in the vehicle's own cm (bow +X, right +Y, up +Z) -- for fitting seats
 // Any chat line starting with '#' is handled here and never reaches the server. Everything goes to
 // Binaries\Win64\plugins\coordinates.csv:
 //   time, x, y, z (cm, the game's world), yaw (degrees), what you are in (vehicle or character class), name, note
@@ -144,6 +146,78 @@ static void goBack(const std::string& name) {
     beep(1700, 2);
 }
 
+// ---- #seat: seats and seated bodies, in vehicle-local cm (2026-11-12, Arini's seat pass) ----
+static uintptr_t fCompsByClass, fCompLoc, fCompRot, fCompScale, fFwd, fRight, fUp, fParentActor, fNumBones, fBoneName, fSocketLoc,
+    fActorScale, cSeat, cVehicle;
+static int oNetChar = -1, oSeatPos = -1, oSeatType = -1, oSeatIdx = -1, oCharMesh = -1, pBoneIdx = -1, pBoneRet = -1, pSockName = -1,
+    pSockRet = -1;
+static const char* kSeatPos[] = {"None", "Sedan", "ScooterDriver", "ScooterPassenger", "BikeDriverUpright", "BikeDriverSport", "Bed", "Chair",
+                                 "Standing_FrontGrip"};
+
+static Vec call3(uintptr_t o, uintptr_t fn) { Vec v{}; if (fn) api->process_event(o, fn, &v); return v; }
+
+static void seatProbe() {
+    uintptr_t pw = pawn();
+    if (!pw) { MT_LOG("seat: not in a world"); beep(300, 2); return; }
+    uintptr_t veh = pw;  // a passenger may be the pawn themself: then the vehicle is what they sit on
+    if (cVehicle && !api->is_a(classOf(veh), cVehicle) && fParentActor) { uintptr_t a = 0; api->process_event(pw, fParentActor, &a); if (a) veh = a; }
+    if (!cVehicle || !api->is_a(classOf(veh), cVehicle)) { MT_LOG("seat: sit in a vehicle first"); beep(300, 3); return; }
+    Vec loc = call3(veh, fLoc), f = call3(veh, fFwd), r = call3(veh, fRight), u = call3(veh, fUp);
+    auto dot = [](Vec a, Vec b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+    auto local = [&](Vec w) { Vec d{w.x - loc.x, w.y - loc.y, w.z - loc.z}; return Vec{dot(d, f), dot(d, r), dot(d, u)}; };
+    Vec vrot = call3(veh, fRot);
+    FILE* out = _wfopen((gameDir() + L"plugins\\seat_probe.txt").c_str(), L"a");
+    if (!out) { beep(300, 3); return; }
+    SYSTEMTIME t; GetLocalTime(&t);
+    fprintf(out, "== %04d-%02d-%02d %02d:%02d:%02d %s (vehicle yaw %.1f pitch %.1f roll %.1f)\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
+            objName(classOf(veh)).c_str(), vrot.y, vrot.x, vrot.z);
+    struct { uintptr_t cls; uintptr_t data; int num, max; } q = {cSeat, 0, 0, 0};
+    api->process_event(veh, fCompsByClass, &q);
+    int seated = 0;
+    for (int i = 0; q.data && i < q.num && i < 64; i++) {
+        uintptr_t c = get<uintptr_t>(q.data + 8ull * i);
+        if (!c) continue;
+        Vec w{}, rot{}, sc{};
+        api->process_event(c, fCompLoc, &w);
+        api->process_event(c, fCompRot, &rot);
+        api->process_event(c, fCompScale, &sc);
+        Vec l = local(w);
+        int pos = oSeatPos >= 0 ? get<uint8_t>(c + oSeatPos) : -1;
+        uintptr_t who = oNetChar >= 0 ? get<uintptr_t>(c + oNetChar) : 0;
+        fprintf(out, "seat %s index %d type %d position %s at %.1f %.1f %.1f, world rot (p %.1f y %.1f r %.1f) = yaw %.1f off the vehicle, scale %.3f %.3f %.3f%s\n",
+                objName(c).c_str(), oSeatIdx >= 0 ? get<int>(c + oSeatIdx) : -1, oSeatType >= 0 ? get<uint8_t>(c + oSeatType) : -1,
+                pos >= 0 && pos < 9 ? kSeatPos[pos] : "?", l.x, l.y, l.z, rot.x, rot.y, rot.z, rot.y - vrot.y, sc.x, sc.y, sc.z,
+                who ? (" -- occupied by " + objName(who)).c_str() : "");
+        if (!who || oCharMesh < 0) continue;
+        seated++;
+        uintptr_t mesh = get<uintptr_t>(who + oCharMesh);
+        Vec as = call3(who, fActorScale), ms{};
+        if (mesh) api->process_event(mesh, fCompScale, &ms);
+        fprintf(out, "  body %s: actor scale %.3f %.3f %.3f, mesh world scale %.3f %.3f %.3f\n", objName(classOf(who)).c_str(), as.x, as.y, as.z, ms.x, ms.y, ms.z);
+        if (!mesh || !fNumBones || !fBoneName || !fSocketLoc || pBoneRet < 0 || pSockName < 0 || pSockRet < 0) continue;
+        int nb = 0; api->process_event(mesh, fNumBones, &nb);
+        double top = -1e9; std::string topName;
+        for (int b = 0; b < nb && b < 400; b++) {
+            unsigned char bp[0x20] = {0};
+            memcpy(bp + (pBoneIdx < 0 ? 0 : pBoneIdx), &b, 4);
+            api->process_event(mesh, fBoneName, bp);
+            unsigned char sp[0x40] = {0};
+            memcpy(sp + pSockName, bp + pBoneRet, 8);  // the FName, passed straight on
+            api->process_event(mesh, fSocketLoc, sp);
+            Vec bw; memcpy(&bw, sp + pSockRet, 24);
+            Vec bl = local(bw);
+            char nm[128] = {0};
+            api->fname((uintptr_t)(bp + pBoneRet), nm, sizeof nm);
+            fprintf(out, "  bone %3d %-28s %.1f %.1f %.1f  (%.1f above the seat)\n", b, nm, bl.x, bl.y, bl.z, bl.z - l.z);
+            if (bl.z > top) { top = bl.z; topName = nm; }
+        }
+        fprintf(out, "  highest bone %s at z %.1f, %.1f above the seat\n", topName.c_str(), top, top - l.z);
+    }
+    fclose(out);
+    MT_LOG("seat: %d seat(s), %d occupied, written to plugins\\seat_probe.txt", q.num, seated);
+    beep(1300, 1);
+}
+
 static void capture(void*) {
     InterlockedExchange(&pending, 0);
     save("", "");
@@ -179,7 +253,8 @@ static int onChat(uintptr_t, uintptr_t func, void* parms, void*) {
     if (cmd == "note") save("", rest.empty() ? "(empty note)" : rest);
     else if (cmd == "save") save(rest, "");
     else if (cmd == "return" || cmd == "back") goBack(rest);
-    else { MT_LOG("chat: unknown command #%s (note, save, return)", cmd.c_str()); beep(300, 2); }
+    else if (cmd == "seat") seatProbe();
+    else { MT_LOG("chat: unknown command #%s (note, save, return, seat)", cmd.c_str()); beep(300, 2); }
     return 1;  // never sent
 }
 
@@ -203,6 +278,24 @@ static DWORD WINAPI run(LPVOID) {
     fRoot = api->find_object("Function", "K2_GetRootComponent", "Actor");
     fSetVel = api->find_object("Function", "SetAllPhysicsLinearVelocity", "PrimitiveComponent");
     cPrim = api->find_object("Class", "PrimitiveComponent", "/Script/Engine");
+    fCompsByClass = api->find_object("Function", "K2_GetComponentsByClass", "Actor");
+    fCompLoc = api->find_object("Function", "K2_GetComponentLocation", "SceneComponent");
+    fCompRot = api->find_object("Function", "K2_GetComponentRotation", "SceneComponent");
+    fCompScale = api->find_object("Function", "K2_GetComponentScale", "SceneComponent");
+    fSocketLoc = api->find_object("Function", "GetSocketLocation", "SceneComponent");
+    fFwd = api->find_object("Function", "GetActorForwardVector", "Actor");
+    fRight = api->find_object("Function", "GetActorRightVector", "Actor");
+    fUp = api->find_object("Function", "GetActorUpVector", "Actor");
+    fActorScale = api->find_object("Function", "GetActorScale3D", "Actor");
+    fParentActor = api->find_object("Function", "GetAttachParentActor", "Actor");
+    fNumBones = api->find_object("Function", "GetNumBones", "SkinnedMeshComponent");
+    fBoneName = api->find_object("Function", "GetBoneName", "SkinnedMeshComponent");
+    cSeat = api->find_object("Class", "MTSeatComponent", "/Script/MotorTown");
+    cVehicle = api->find_object("Class", "MTVehicle", "/Script/MotorTown");
+    if (cSeat) { oNetChar = off(cSeat, "Net_Character"); oSeatPos = off(cSeat, "SeatPositionType"); oSeatType = off(cSeat, "SeatType"); oSeatIdx = off(cSeat, "SeatIndex"); }
+    if (uintptr_t cChar = api->find_object("Class", "Character", "/Script/Engine")) oCharMesh = off(cChar, "Mesh");
+    if (fBoneName) { pBoneIdx = off(fBoneName, "BoneIndex"); pBoneRet = off(fBoneName, "ReturnValue"); }
+    if (fSocketLoc) { pSockName = off(fSocketLoc, "InSocketName"); pSockRet = off(fSocketLoc, "ReturnValue"); }
     CloseHandle(CreateThread(nullptr, 0, watchChat, nullptr, 0, nullptr));
     int key = iniInt(INI, L"Coordinates", L"Hotkey", 11);
     if (key < 1 || key > 12) key = 11;
