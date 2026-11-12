@@ -6,8 +6,9 @@
 //   #save <name>     saves a spot with that name                                    (typed in chat)
 //   #return [name]   puts you, or the vehicle you drive, back on it; no name = the last spot saved
 //   #note <text>     saves the text with where you are
-//   #seat            (sitting in a vehicle) writes every seat of it and every bone of whoever sits in one to
-//                    plugins\seat_probe.txt, in the vehicle's own cm (bow +X, right +Y, up +Z) -- for fitting seats
+//   #seat            rewrites the seat files of the vehicle you sit in. They are also written by themselves: any seat
+//                    occupied for 3 s gets plugins\seat_probe\<Vehicle>__<Seat>.txt once -- every seat of the vehicle and
+//                    every bone of whoever sits there, in the vehicle's own cm ([Coordinates] AutoSeat=0 stops it)
 // Any chat line starting with '#' is handled here and never reaches the server. Everything goes to
 // Binaries\Win64\plugins\coordinates.csv:
 //   time, x, y, z (cm, the game's world), yaw (degrees), what you are in (vehicle or character class), name, note
@@ -19,6 +20,8 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <set>
+#include <map>
 #include "../include/mt_plugin.hpp"
 
 using namespace mt;
@@ -156,66 +159,108 @@ static const char* kSeatPos[] = {"None", "Sedan", "ScooterDriver", "ScooterPasse
 
 static Vec call3(uintptr_t o, uintptr_t fn) { Vec v{}; if (fn) api->process_event(o, fn, &v); return v; }
 
-static void seatProbe() {
+// One file per vehicle and seat, plugins\seat_probe\<Vehicle>__<Seat>.txt: the vehicle's seat list, then the seat probed
+// and every bone of whoever sits in it. Automatic (the user, 2026-11-12: "when I'm inside a vehicle, it's always going
+// to grab that information"): a seat occupied for 3 s that has no file yet is written once; #seat rewrites them all.
+static std::set<std::string> seatDone;
+static std::map<uintptr_t, std::pair<uintptr_t, ULONGLONG>> seatSince;  // seat -> occupant, since when
+static void seatProbe(bool manual) {
     uintptr_t pw = pawn();
-    if (!pw) { MT_LOG("seat: not in a world"); beep(300, 2); return; }
+    if (!pw) { if (manual) { MT_LOG("seat: not in a world"); beep(300, 2); } return; }
     uintptr_t veh = pw;  // a passenger may be the pawn themself: then the vehicle is what they sit on
     if (cVehicle && !api->is_a(classOf(veh), cVehicle) && fParentActor) { uintptr_t a = 0; api->process_event(pw, fParentActor, &a); if (a) veh = a; }
-    if (!cVehicle || !api->is_a(classOf(veh), cVehicle)) { MT_LOG("seat: sit in a vehicle first"); beep(300, 3); return; }
+    if (!cVehicle || !api->is_a(classOf(veh), cVehicle)) { if (manual) { MT_LOG("seat: sit in a vehicle first"); beep(300, 3); } return; }
     Vec loc = call3(veh, fLoc), f = call3(veh, fFwd), r = call3(veh, fRight), u = call3(veh, fUp);
     auto dot = [](Vec a, Vec b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
     auto local = [&](Vec w) { Vec d{w.x - loc.x, w.y - loc.y, w.z - loc.z}; return Vec{dot(d, f), dot(d, r), dot(d, u)}; };
     Vec vrot = call3(veh, fRot);
-    FILE* out = _wfopen((gameDir() + L"plugins\\seat_probe.txt").c_str(), L"a");
-    if (!out) { beep(300, 3); return; }
-    SYSTEMTIME t; GetLocalTime(&t);
-    fprintf(out, "== %04d-%02d-%02d %02d:%02d:%02d %s (vehicle yaw %.1f pitch %.1f roll %.1f)\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
-            objName(classOf(veh)).c_str(), vrot.y, vrot.x, vrot.z);
+    std::string cls = objName(classOf(veh));
     struct { uintptr_t cls; uintptr_t data; int num, max; } q = {cSeat, 0, 0, 0};
     api->process_event(veh, fCompsByClass, &q);
-    int seated = 0;
-    for (int i = 0; q.data && i < q.num && i < 64; i++) {
-        uintptr_t c = get<uintptr_t>(q.data + 8ull * i);
-        if (!c) continue;
+    std::vector<uintptr_t> seats;
+    for (int i = 0; q.data && i < q.num && i < 64; i++) if (uintptr_t c = get<uintptr_t>(q.data + 8ull * i)) seats.push_back(c);
+    std::string list;
+    std::vector<Vec> at(seats.size());
+    for (size_t i = 0; i < seats.size(); i++) {
+        uintptr_t c = seats[i];
         Vec w{}, rot{}, sc{};
         api->process_event(c, fCompLoc, &w);
         api->process_event(c, fCompRot, &rot);
         api->process_event(c, fCompScale, &sc);
-        Vec l = local(w);
+        at[i] = local(w);
         int pos = oSeatPos >= 0 ? get<uint8_t>(c + oSeatPos) : -1;
         uintptr_t who = oNetChar >= 0 ? get<uintptr_t>(c + oNetChar) : 0;
-        fprintf(out, "seat %s index %d type %d position %s at %.1f %.1f %.1f, world rot (p %.1f y %.1f r %.1f) = yaw %.1f off the vehicle, scale %.3f %.3f %.3f%s\n",
-                objName(c).c_str(), oSeatIdx >= 0 ? get<int>(c + oSeatIdx) : -1, oSeatType >= 0 ? get<uint8_t>(c + oSeatType) : -1,
-                pos >= 0 && pos < 9 ? kSeatPos[pos] : "?", l.x, l.y, l.z, rot.x, rot.y, rot.z, rot.y - vrot.y, sc.x, sc.y, sc.z,
-                who ? (" -- occupied by " + objName(who)).c_str() : "");
-        if (!who || oCharMesh < 0) continue;
-        seated++;
+        char b[512];
+        snprintf(b, sizeof b, "seat %s index %d type %d position %s at %.1f %.1f %.1f, world rot (p %.1f y %.1f r %.1f) = yaw %.1f off the vehicle, scale %.3f %.3f %.3f%s\n",
+                 objName(c).c_str(), oSeatIdx >= 0 ? get<int>(c + oSeatIdx) : -1, oSeatType >= 0 ? get<uint8_t>(c + oSeatType) : -1,
+                 pos >= 0 && pos < 9 ? kSeatPos[pos] : "?", at[i].x, at[i].y, at[i].z, rot.x, rot.y, rot.z, rot.y - vrot.y, sc.x, sc.y, sc.z,
+                 who ? (" -- occupied by " + objName(who)).c_str() : "");
+        list += b;
+    }
+    int wrote = 0;
+    ULONGLONG nowMs = GetTickCount64();
+    for (size_t i = 0; i < seats.size(); i++) {
+        uintptr_t c = seats[i], who = oNetChar >= 0 ? get<uintptr_t>(seats[i] + oNetChar) : 0;
+        if (!who || oCharMesh < 0) { seatSince.erase(c); continue; }
+        std::string key = cls + "__" + objName(c);
+        std::wstring dir = gameDir() + L"plugins\\seat_probe", path = dir + L"\\" + std::wstring(key.begin(), key.end()) + L".txt";
+        if (!manual) {
+            if (seatDone.count(key)) continue;
+            if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) { seatDone.insert(key); continue; }
+            auto& since = seatSince[c];
+            if (since.first != who) { since = {who, nowMs}; continue; }
+            if (nowMs - since.second < 3000) continue;  // let the sit-down animation finish
+        }
+        CreateDirectoryW(dir.c_str(), nullptr);
+        FILE* out = _wfopen(path.c_str(), L"w");
+        if (!out) continue;
+        SYSTEMTIME t; GetLocalTime(&t);
+        fprintf(out, "== %04d-%02d-%02d %02d:%02d:%02d %s (vehicle yaw %.1f pitch %.1f roll %.1f), vehicle-local cm: bow +X, right +Y, up +Z\n",
+                t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, cls.c_str(), vrot.y, vrot.x, vrot.z);
+        fputs(list.c_str(), out);
+        fprintf(out, "probed seat %s\n", objName(c).c_str());
         uintptr_t mesh = get<uintptr_t>(who + oCharMesh);
         Vec as = call3(who, fActorScale), ms{};
         if (mesh) api->process_event(mesh, fCompScale, &ms);
         fprintf(out, "  body %s: actor scale %.3f %.3f %.3f, mesh world scale %.3f %.3f %.3f\n", objName(classOf(who)).c_str(), as.x, as.y, as.z, ms.x, ms.y, ms.z);
-        if (!mesh || !fNumBones || !fBoneName || !fSocketLoc || pBoneRet < 0 || pSockName < 0 || pSockRet < 0) continue;
-        int nb = 0; api->process_event(mesh, fNumBones, &nb);
-        double top = -1e9; std::string topName;
-        for (int b = 0; b < nb && b < 400; b++) {
-            unsigned char bp[0x20] = {0};
-            memcpy(bp + (pBoneIdx < 0 ? 0 : pBoneIdx), &b, 4);
-            api->process_event(mesh, fBoneName, bp);
-            unsigned char sp[0x40] = {0};
-            memcpy(sp + pSockName, bp + pBoneRet, 8);  // the FName, passed straight on
-            api->process_event(mesh, fSocketLoc, sp);
-            Vec bw; memcpy(&bw, sp + pSockRet, 24);
-            Vec bl = local(bw);
-            char nm[128] = {0};
-            api->fname((uintptr_t)(bp + pBoneRet), nm, sizeof nm);
-            fprintf(out, "  bone %3d %-28s %.1f %.1f %.1f  (%.1f above the seat)\n", b, nm, bl.x, bl.y, bl.z, bl.z - l.z);
-            if (bl.z > top) { top = bl.z; topName = nm; }
+        if (mesh && fNumBones && fBoneName && fSocketLoc && pBoneRet >= 0 && pSockName >= 0 && pSockRet >= 0) {
+            int nb = 0; api->process_event(mesh, fNumBones, &nb);
+            double top = -1e9; std::string topName;
+            for (int b = 0; b < nb && b < 400; b++) {
+                unsigned char bp[0x20] = {0};
+                memcpy(bp + (pBoneIdx < 0 ? 0 : pBoneIdx), &b, 4);
+                api->process_event(mesh, fBoneName, bp);
+                unsigned char sp[0x40] = {0};
+                memcpy(sp + pSockName, bp + pBoneRet, 8);  // the FName, passed straight on
+                api->process_event(mesh, fSocketLoc, sp);
+                Vec bw; memcpy(&bw, sp + pSockRet, 24);
+                Vec bl = local(bw);
+                char nm[128] = {0};
+                api->fname((uintptr_t)(bp + pBoneRet), nm, sizeof nm);
+                fprintf(out, "  bone %3d %-28s %.1f %.1f %.1f  (%.1f above the seat)\n", b, nm, bl.x, bl.y, bl.z, bl.z - at[i].z);
+                if (bl.z > top) { top = bl.z; topName = nm; }
+            }
+            fprintf(out, "  highest bone %s at z %.1f, %.1f above the seat\n", topName.c_str(), top, top - at[i].z);
         }
-        fprintf(out, "  highest bone %s at z %.1f, %.1f above the seat\n", topName.c_str(), top, top - l.z);
+        fclose(out);
+        seatDone.insert(key);
+        wrote++;
+        MT_LOG("seat: %s recorded to plugins\\seat_probe\\%s.txt", key.c_str(), key.c_str());
     }
-    fclose(out);
-    MT_LOG("seat: %d seat(s), %d occupied, written to plugins\\seat_probe.txt", q.num, seated);
-    beep(1300, 1);
+    if (manual) { MT_LOG("seat: %zu seat(s), %d written", seats.size(), wrote); beep(wrote ? 1300 : 300, wrote ? 1 : 2); }
+}
+
+static volatile LONG seatPending;
+static bool kAutoSeat = true;
+static void autoSeat(void*) {
+    InterlockedExchange(&seatPending, 0);
+    static ULONGLONG lastSearch;
+    // no player controller yet (the main menu): the search walks every object, so not more than once in 30 s
+    if (!pcObj || api->object(pcIdx) != pcObj) {
+        if (GetTickCount64() - lastSearch < 30000) return;
+        lastSearch = GetTickCount64();
+    }
+    seatProbe(false);
 }
 
 static void capture(void*) {
@@ -253,7 +298,7 @@ static int onChat(uintptr_t, uintptr_t func, void* parms, void*) {
     if (cmd == "note") save("", rest.empty() ? "(empty note)" : rest);
     else if (cmd == "save") save(rest, "");
     else if (cmd == "return" || cmd == "back") goBack(rest);
-    else if (cmd == "seat") seatProbe();
+    else if (cmd == "seat") seatProbe(true);
     else { MT_LOG("chat: unknown command #%s (note, save, return, seat)", cmd.c_str()); beep(300, 2); }
     return 1;  // never sent
 }
@@ -300,8 +345,13 @@ static DWORD WINAPI run(LPVOID) {
     int key = iniInt(INI, L"Coordinates", L"Hotkey", 11);
     if (key < 1 || key > 12) key = 11;
     MT_LOG("Coordinates ready: Ctrl+F%d saves a spot to plugins\\coordinates.csv", key);
+    kAutoSeat = iniInt(INI, L"Coordinates", L"AutoSeat", 1) != 0;
     bool down = false;
-    for (;;) {
+    for (int tick = 0;; tick++) {
+        if (kAutoSeat && tick % 125 == 0 && !seatPending && api->game_thread_ready()) {  // every 2 s
+            InterlockedExchange(&seatPending, 1);
+            api->run_on_game_thread(autoSeat, nullptr);
+        }
         bool k = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_F1 + key - 1) & 0x8000);
         if (k && !down && !pending) {
             InterlockedExchange(&pending, 1);
